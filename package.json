@@ -1,0 +1,32 @@
+{
+  "name": "bb-plugin-sidebar-sync",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "bb": ">=0.36",
+    "bbPluginSdk": "^0.4.1"
+  },
+  "bb": {
+    "name": "Sidebar sync",
+    "description": "Keep the sidebar arrangement — nav order, hidden rows, collapsed sections, project and thread order — the same in every bb UI",
+    "branding": {
+      "icon": "Refresh"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx"
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types --test-timeout=10000 lib/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}
