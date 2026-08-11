@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  planSeed,
   DEFAULT_SYNCED_KEYS,
   DEVICE_LOCAL_KEYS,
   parseSyncedKeys,
@@ -156,4 +157,34 @@ test("several changed keys publish together in one write", () => {
     "bb.sidebar.sectionOrder": '["b"]',
     "bb.sidebar.collapsedProjects": '["p"]',
   });
+});
+
+// ------------------------------------------------------------- seeding ---
+
+test("SEEDING: a device with an existing arrangement seeds an empty server", () => {
+  const seed = planSeed(
+    { "bb.sidebar.hiddenPluginPanels": '["a"]', "bb.sidebar.sectionOrder": '["s"]' },
+    DEFAULT_SYNCED_KEYS,
+  );
+  assert.deepEqual(seed, {
+    "bb.sidebar.hiddenPluginPanels": '["a"]',
+    "bb.sidebar.sectionOrder": '["s"]',
+  });
+});
+
+test("seeding skips keys the device has no value for", () => {
+  const seed = planSeed({ "bb.sidebar.sectionOrder": '["s"]' }, DEFAULT_SYNCED_KEYS);
+  assert.deepEqual(Object.keys(seed ?? {}), ["bb.sidebar.sectionOrder"]);
+});
+
+test("a device with nothing set seeds nothing", () => {
+  assert.equal(planSeed({}, DEFAULT_SYNCED_KEYS), null);
+});
+
+test("seeding never includes device-local keys", () => {
+  const seed = planSeed(
+    { "bb.sidebar.width": "500", "bb.sidebar.sectionOrder": '["s"]' },
+    DEFAULT_SYNCED_KEYS,
+  );
+  assert.deepEqual(Object.keys(seed ?? {}), ["bb.sidebar.sectionOrder"]);
 });

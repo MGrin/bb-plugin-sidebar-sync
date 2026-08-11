@@ -12,6 +12,7 @@ import { definePluginApp, useRpc, useRealtime } from "@bb/plugin-sdk/app";
 import {
   planApply,
   planPublish,
+  planSeed,
   type Snapshot,
   type StoredValue,
 } from "./lib/sync.ts";
@@ -87,7 +88,18 @@ function SidebarSync() {
       // Seed lastKnown from what is already here BEFORE applying, so keys the
       // server does not carry are not mistaken for fresh local edits later.
       lastKnown.current = readLocal(keys);
-      apply(snapshot as Snapshot | null, keys);
+
+      if (snapshot === null) {
+        // Nothing shared yet: this device's arrangement becomes the shared one.
+        // Without this, a sidebar arranged before the plugin was installed is
+        // invisible to the poller forever — mount already recorded it as known.
+        const seed = planSeed(lastKnown.current, keys);
+        if (seed !== null) {
+          void rpcRef.current.call("push", { values: seed, deviceId: me.current });
+        }
+      } else {
+        apply(snapshot as Snapshot, keys);
+      }
       ready.current = true;
 
       timer = setInterval(() => {

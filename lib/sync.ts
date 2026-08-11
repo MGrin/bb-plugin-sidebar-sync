@@ -88,6 +88,26 @@ export function planApply(args: PlanApplyArgs): ApplyStep[] {
   return steps;
 }
 
+/**
+ * What to publish when the server has nothing yet. Without this a device that
+ * arranged its sidebar BEFORE the plugin was installed never seeds: mount
+ * records the current values as "last known", so the poller sees no change and
+ * stays silent forever, and every other device keeps its own arrangement.
+ * Only keys that actually have a value are seeded — absent keys are not
+ * opinions and must not be broadcast as ones.
+ */
+export function planSeed(
+  local: Record<string, StoredValue>,
+  syncedKeys: readonly string[],
+): Record<string, StoredValue> | null {
+  const seed: Record<string, StoredValue> = {};
+  for (const key of syncedKeys) {
+    const value = local[key] ?? null;
+    if (value !== null) seed[key] = value;
+  }
+  return Object.keys(seed).length === 0 ? null : seed;
+}
+
 export interface PlanPublishArgs {
   local: Record<string, StoredValue>;
   /**
