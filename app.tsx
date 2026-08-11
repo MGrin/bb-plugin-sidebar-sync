@@ -11,9 +11,12 @@ import { useEffect, useRef, useState } from "react";
 import { definePluginApp, useRpc, useRealtime } from "@bb/plugin-sdk/app";
 import {
   DEFAULT_SYNCED_KEYS,
-  planApply,
+  DEVICE_STATE_KEY,
+  parseDeviceState,
   planPublish,
-  planSeed,
+  planSync,
+  serializeDeviceState,
+  type DeviceState,
   type Snapshot,
   type StoredValue,
 } from "./lib/sync.ts";
@@ -51,32 +54,68 @@ function writeLocal(key: string, value: StoredValue): void {
   );
 }
 
+/**
+ * What this device knows, kept in localStorage rather than in a ref, because
+ * this component unmounts every time a thread is opened. See DeviceState.
+ */
+function readState(): DeviceState | null {
+  return parseDeviceState(localStorage.getItem(DEVICE_STATE_KEY));
+}
+
+function writeState(state: DeviceState): void {
+  localStorage.setItem(DEVICE_STATE_KEY, serializeDeviceState(state));
+}
+
 function SidebarSync() {
   const rpc = useRpc<typeof rpcContract>();
   const [syncedKeys, setSyncedKeys] = useState<readonly string[]>([]);
-  // Values this device has last seen or written. Applying a remote value folds
-  // it in here so the poller does not read it back as a local edit and bounce
-  // it to the server — the loop guard.
-  const lastKnown = useRef<Record<string, StoredValue>>({});
   const me = useRef<string>("");
-  const ready = useRef(false);
-  // useRpc() hands back a new object every render. Depending on it in the
-  // effect re-ran the whole setup on each render, which re-seeded lastKnown
-  // from current localStorage — quietly absorbing every local edit before the
-  // poller could notice it. Hold it in a ref and run the effect exactly once.
+  // useRpc() hands back a new object every render, so depending on it in the
+  // effect would re-run the whole setup on each render. Hold it in a ref.
   const rpcRef = useRef(rpc);
   rpcRef.current = rpc;
   const keysRef = useRef<readonly string[]>([]);
 
   if (me.current === "") me.current = deviceId();
 
-  const apply = (snapshot: Snapshot | null, keys: readonly string[]) => {
-    const steps = planApply({ remote: snapshot, local: readLocal(keys), syncedKeys: keys });
-    for (const step of steps) {
-      writeLocal(step.key, step.value);
-      lastKnown.current[step.key] = step.value;
+  /**
+   * The one path that touches localStorage. Applies what is genuinely new,
+   * publishes what this device changed, and records both — but only records a
+   * published value AFTER the server has it, so a failed push retries on the
+   * next mount instead of being silently forgotten.
+   */
+  const reconcile = async (snapshot: Snapshot | null, keys: readonly string[]) => {
+    const before = readState();
+    const plan = planSync({
+      remote: snapshot,
+      local: readLocal(keys),
+      state: before,
+      syncedKeys: keys,
+      me: me.current,
+    });
+
+    for (const step of plan.apply) writeLocal(step.key, step.value);
+
+    // Persist the applied half immediately. Keys still in flight keep their old
+    // baseline, which is what makes an unlanded push retry rather than vanish.
+    const pending: Record<string, StoredValue> = { ...plan.nextKnown };
+    if (plan.publish !== null) {
+      for (const key of Object.keys(plan.publish)) {
+        if (before !== null && key in before.lastKnown) pending[key] = before.lastKnown[key];
+        else delete pending[key];
+      }
     }
-    return steps.length;
+    writeState({ lastKnown: pending, lastAppliedAt: plan.nextAppliedAt });
+
+    if (plan.publish === null) return;
+    const { updatedAt } = await rpcRef.current.call("push", {
+      values: plan.publish,
+      deviceId: me.current,
+    });
+    writeState({
+      lastKnown: plan.nextKnown,
+      lastAppliedAt: Math.max(plan.nextAppliedAt, updatedAt),
+    });
   };
 
   // Initial pull, then a poll that publishes local edits.
@@ -85,6 +124,37 @@ function SidebarSync() {
     let timer: ReturnType<typeof setInterval> | undefined;
     let publishOnHide: (() => void) | undefined;
     let onHideCleanup: (() => void) | undefined;
+    let ready = false;
+
+    /**
+     * Send up whatever changed here since the persisted baseline. Used by the
+     * poll, by page-hide, and by unmount — the last one matters most, because
+     * opening a thread unmounts this component and used to drop the edit.
+     */
+    const publishIfChanged = () => {
+      if (!ready) return;
+      const keys = keysRef.current;
+      const state = readState();
+      if (state === null || keys.length === 0) return;
+      const changed = planPublish({
+        local: readLocal(keys),
+        lastKnown: state.lastKnown,
+        syncedKeys: keys,
+      });
+      if (changed === null) return;
+      void rpcRef.current
+        .call("push", { values: changed, deviceId: me.current })
+        .then(({ updatedAt }) => {
+          const current = readState() ?? state;
+          writeState({
+            lastKnown: { ...current.lastKnown, ...changed },
+            lastAppliedAt: Math.max(current.lastAppliedAt, updatedAt),
+          });
+        })
+        .catch(() => {
+          // Left unrecorded on purpose: the next mount will try again.
+        });
+    };
 
     void (async () => {
       const probe = readLocal(DEFAULT_SYNCED_KEYS);
@@ -97,37 +167,12 @@ function SidebarSync() {
       setSyncedKeys(keys);
       keysRef.current = keys;
 
-      // Seed lastKnown from what is already here BEFORE applying, so keys the
-      // server does not carry are not mistaken for fresh local edits later.
-      lastKnown.current = readLocal(keys);
-
-      if (snapshot === null) {
-        // Nothing shared yet: this device's arrangement becomes the shared one.
-        // Without this, a sidebar arranged before the plugin was installed is
-        // invisible to the poller forever — mount already recorded it as known.
-        const seed = planSeed(lastKnown.current, keys);
-        if (seed !== null) {
-          void rpcRef.current.call("push", { values: seed, deviceId: me.current });
-        }
-      } else {
-        apply(snapshot as Snapshot, keys);
-      }
-      ready.current = true;
-
-      const publishIfChanged = () => {
-        if (!ready.current) return;
-        const local = readLocal(keys);
-        const changed = planPublish({ local, lastKnown: lastKnown.current, syncedKeys: keys });
-        if (changed === null) return;
-        lastKnown.current = { ...lastKnown.current, ...changed };
-        void rpcRef.current.call("push", { values: changed, deviceId: me.current });
-      };
+      await reconcile(snapshot as Snapshot | null, keys);
+      if (cancelled) return;
+      ready = true;
 
       timer = setInterval(publishIfChanged, POLL_MS);
 
-      // Publish on the way out too, so rearranging the sidebar and immediately
-      // switching to the other device does not wait out the minute. This is
-      // what makes a slow poll acceptable rather than annoying.
       publishOnHide = () => {
         if (document.visibilityState === "hidden") publishIfChanged();
       };
@@ -141,6 +186,9 @@ function SidebarSync() {
 
     return () => {
       cancelled = true;
+      // Flush before going away. Leaving the homepage for a thread is the
+      // common exit, and the 60s timer will usually never have fired.
+      publishIfChanged();
       if (timer !== undefined) clearInterval(timer);
       onHideCleanup?.();
     };
@@ -148,12 +196,12 @@ function SidebarSync() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Another UI changed the arrangement — apply it now rather than on reload.
+  // Another UI changed the arrangement — fold it in now rather than on reload.
+  // Same path as mount, so a local edit still beats an incoming remote one.
   useRealtime("sidebar-sync.changed", (payload) => {
     const snapshot = payload as Snapshot;
-    if (snapshot?.updatedBy === me.current) return;
     if (keysRef.current.length === 0) return;
-    apply(snapshot, keysRef.current);
+    void reconcile(snapshot, keysRef.current);
   });
 
   // A visible line, deliberately: the slot only mounts when it renders, and a

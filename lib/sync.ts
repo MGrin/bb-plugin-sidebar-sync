@@ -129,3 +129,112 @@ export function planPublish(args: PlanPublishArgs): Record<string, StoredValue> 
   }
   return Object.keys(changed).length === 0 ? null : changed;
 }
+
+// -------------------------------------------------------- device state ---
+
+/**
+ * What this device carries BETWEEN mounts. It has to outlive the React tree:
+ * the frontend is a route-scoped homepage section, so it unmounts the moment a
+ * thread is opened. When this lived in a `useRef` the plugin forgot, on every
+ * unmount, both which values it had already seen and which snapshot it had
+ * already applied — so the next homepage visit re-applied an old snapshot over
+ * edits made in between. That is the revert bug; persistence is the fix.
+ */
+export interface DeviceState {
+  /** Values this device has last seen or written; the baseline for "what changed here". */
+  lastKnown: Record<string, StoredValue>;
+  /** `updatedAt` of the newest snapshot already folded in. Never re-apply at or below it. */
+  lastAppliedAt: number;
+}
+
+export const DEVICE_STATE_KEY = "bb.sidebar-sync.state";
+
+export function serializeDeviceState(state: DeviceState): string {
+  return JSON.stringify(state);
+}
+
+/** Tolerant on purpose: a corrupt blob must degrade to "first run", never throw. */
+export function parseDeviceState(raw: StoredValue): DeviceState | null {
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const { lastKnown, lastAppliedAt } = parsed as Partial<DeviceState>;
+  if (typeof lastKnown !== "object" || lastKnown === null || Array.isArray(lastKnown)) return null;
+  if (typeof lastAppliedAt !== "number" || !Number.isFinite(lastAppliedAt)) return null;
+  return { lastKnown, lastAppliedAt };
+}
+
+export interface PlanSyncArgs {
+  remote: Snapshot | null;
+  local: Record<string, StoredValue>;
+  /** null on the very first run of this device — it then has no edits to claim. */
+  state: DeviceState | null;
+  syncedKeys: readonly string[];
+  me: string;
+}
+
+export interface SyncPlan {
+  /** localStorage writes to make. */
+  apply: ApplyStep[];
+  /** Keys to send up, or null. */
+  publish: Record<string, StoredValue> | null;
+  /** The baseline to persist once the writes land. */
+  nextKnown: Record<string, StoredValue>;
+  /** The `lastAppliedAt` to persist. */
+  nextAppliedAt: number;
+}
+
+/**
+ * Reconcile this device against the server, once per mount.
+ *
+ * Three rules, in order of who wins:
+ *
+ * 1. A snapshot at or below `lastAppliedAt` is old news and is NEVER re-applied,
+ *    however much the local values differ from it. Differing means the human
+ *    changed something since — not that this device has fallen behind.
+ * 2. A key edited locally since `lastKnown` beats the remote value for that key,
+ *    and is published instead. The arrangement the human can see wins.
+ * 3. Everything else in a newer snapshot is applied.
+ */
+export function planSync(args: PlanSyncArgs): SyncPlan {
+  const { remote, local, state, syncedKeys, me } = args;
+  const lastAppliedAt = state?.lastAppliedAt ?? 0;
+
+  // Rule 2 — what changed HERE since we last looked. A first run has no
+  // baseline, so it claims no edits: everything present is just what it found.
+  const edits =
+    state === null ? null : planPublish({ local, lastKnown: state.lastKnown, syncedKeys });
+
+  // Rule 1 — only a snapshot we have not already folded in is worth reading.
+  const isNews = remote !== null && remote.updatedAt > lastAppliedAt;
+  // Our own echo carries no information we do not already have locally, but it
+  // must still advance the watermark or every later mount reconsiders it.
+  const readable = isNews && remote.updatedBy !== me ? remote : null;
+
+  // Rule 3 — apply the newer snapshot, minus the keys we are about to publish.
+  const apply = planApply({ remote: readable, local, syncedKeys }).filter(
+    (step) => edits === null || !(step.key in edits),
+  );
+
+  // An empty server needs seeding, but only from a device with no edits to
+  // send: with edits, publishing those is both smaller and more current.
+  const publish =
+    edits ?? (remote === null ? planSeed(local, syncedKeys) : null);
+
+  const nextKnown: Record<string, StoredValue> = {};
+  for (const key of syncedKeys) nextKnown[key] = local[key] ?? null;
+  for (const step of apply) nextKnown[step.key] = step.value;
+  if (publish !== null) for (const [key, value] of Object.entries(publish)) nextKnown[key] = value;
+
+  return {
+    apply,
+    publish,
+    nextKnown,
+    nextAppliedAt: isNews ? (remote as Snapshot).updatedAt : lastAppliedAt,
+  };
+}
