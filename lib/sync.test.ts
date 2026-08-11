@@ -10,9 +10,13 @@ import {
   type Snapshot,
 } from "./sync.ts";
 
+// Widened: DEFAULT_SYNCED_KEYS is an `as const` tuple, so .includes() rejects
+// any literal outside it — including the ones these tests assert are absent.
+const SYNCED: readonly string[] = DEFAULT_SYNCED_KEYS;
+
 test("width and open are device-local and never synced by default", () => {
   for (const key of DEVICE_LOCAL_KEYS) {
-    assert.ok(!DEFAULT_SYNCED_KEYS.includes(key), `${key} must not sync`);
+    assert.ok(!SYNCED.includes(key), `${key} must not sync`);
   }
   assert.ok(DEVICE_LOCAL_KEYS.includes("bb.sidebar.width"));
   assert.ok(DEVICE_LOCAL_KEYS.includes("bb.sidebar.open"));
@@ -26,7 +30,7 @@ test("the default set covers the arrangement keys", () => {
     "bb.sidebar.collapsedProjects",
     "bb.sidebar.organizationMode",
   ]) {
-    assert.ok(DEFAULT_SYNCED_KEYS.includes(key), `${key} should sync`);
+    assert.ok(SYNCED.includes(key), `${key} should sync`);
   }
 });
 
