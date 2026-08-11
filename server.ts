@@ -11,13 +11,19 @@ import { z } from "zod";
 import { parseSyncedKeys, type Snapshot, type StoredValue } from "./lib/sync.ts";
 
 const SNAPSHOT_KEY = "snapshot";
+const SEEN_KEY = "devices-seen";
 export const CHANGED_CHANNEL = "sidebar-sync.changed";
 
 const storedValue = z.union([z.string(), z.null()]);
 
 export const rpcContract = defineRpcContract({
   pull: {
-    input: z.null(),
+    // Devices identify themselves and report how much arrangement they hold.
+    // Without this there is no way to tell "no device is calling" apart from
+    // "devices call but have nothing to seed" — which cost a debugging round.
+    input: z
+      .object({ deviceId: z.string(), localKeys: z.number() })
+      .nullable(),
     output: z.object({
       snapshot: z
         .object({
@@ -53,8 +59,15 @@ export default async function plugin(bb: BbPluginApi) {
     (await bb.storage.kv.get<Snapshot>(SNAPSHOT_KEY)) ?? null;
 
   bb.rpc.register(rpcContract, {
-    async pull() {
+    async pull(input) {
       const cfg = await settings.get();
+      if (input !== null) {
+        const seen =
+          (await bb.storage.kv.get<Record<string, { at: number; localKeys: number }>>(SEEN_KEY)) ??
+          {};
+        seen[input.deviceId] = { at: Date.now(), localKeys: input.localKeys };
+        await bb.storage.kv.set(SEEN_KEY, seen);
+      }
       return {
         snapshot: await loadSnapshot(),
         syncedKeys: parseSyncedKeys(cfg.syncedKeys),
@@ -103,12 +116,27 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const snap = await loadSnapshot();
       const cfg = await settings.get();
+      const seen =
+        (await bb.storage.kv.get<Record<string, { at: number; localKeys: number }>>(SEEN_KEY)) ?? {};
+      const devices = Object.entries(seen).map(
+        ([id, d]) =>
+          `  ${id.slice(0, 8)}  last seen ${new Date(d.at).toISOString()}  holds ${d.localKeys} keys`,
+      );
+      const deviceBlock =
+        devices.length === 0
+          ? "devices: none have called in — no UI is running the plugin frontend"
+          : `devices (${devices.length}):\n${devices.join("\n")}`;
+
       if (snap === null) {
-        return { exitCode: 0, stdout: "no snapshot yet — open a bb UI to seed it" };
+        return {
+          exitCode: 0,
+          stdout: `no snapshot yet — open a bb UI to seed it\n${deviceBlock}`,
+        };
       }
       const lines = [
         `updated: ${new Date(snap.updatedAt).toISOString()} by ${snap.updatedBy}`,
         `keys:    ${Object.keys(snap.values).length} stored / ${parseSyncedKeys(cfg.syncedKeys).length} synced`,
+        deviceBlock,
         ...Object.entries(snap.values).map(
           ([k, v]) => `  ${k} = ${v === null ? "(unset)" : v.slice(0, 60)}`,
         ),

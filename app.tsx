@@ -10,6 +10,7 @@
 import { useEffect, useRef, useState } from "react";
 import { definePluginApp, useRpc, useRealtime } from "@bb/plugin-sdk/app";
 import {
+  DEFAULT_SYNCED_KEYS,
   planApply,
   planPublish,
   planSeed,
@@ -18,7 +19,11 @@ import {
 } from "./lib/sync.ts";
 import type { rpcContract } from "./server";
 
-const POLL_MS = 1000;
+// Once a minute. This is a usability preference, not live state: the receiving
+// side is already instant via the realtime channel, so the poll only governs
+// how quickly a local edit is NOTICED. A 1s timer on a phone that is already
+// struggling costs more than it buys.
+const POLL_MS = 60_000;
 const DEVICE_ID_KEY = "bb.sidebar-sync.deviceId";
 
 /** Stable per-browser id, so a device can ignore the echo of its own push. */
@@ -78,9 +83,16 @@ function SidebarSync() {
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | undefined;
+    let publishOnHide: (() => void) | undefined;
+    let onHideCleanup: (() => void) | undefined;
 
     void (async () => {
-      const { snapshot, syncedKeys: keys } = await rpcRef.current.call("pull", null);
+      const probe = readLocal(DEFAULT_SYNCED_KEYS);
+      const held = Object.values(probe).filter((v) => v !== null).length;
+      const { snapshot, syncedKeys: keys } = await rpcRef.current.call("pull", {
+        deviceId: me.current,
+        localKeys: held,
+      });
       if (cancelled) return;
       setSyncedKeys(keys);
       keysRef.current = keys;
@@ -102,19 +114,35 @@ function SidebarSync() {
       }
       ready.current = true;
 
-      timer = setInterval(() => {
+      const publishIfChanged = () => {
         if (!ready.current) return;
         const local = readLocal(keys);
         const changed = planPublish({ local, lastKnown: lastKnown.current, syncedKeys: keys });
         if (changed === null) return;
         lastKnown.current = { ...lastKnown.current, ...changed };
         void rpcRef.current.call("push", { values: changed, deviceId: me.current });
-      }, POLL_MS);
+      };
+
+      timer = setInterval(publishIfChanged, POLL_MS);
+
+      // Publish on the way out too, so rearranging the sidebar and immediately
+      // switching to the other device does not wait out the minute. This is
+      // what makes a slow poll acceptable rather than annoying.
+      publishOnHide = () => {
+        if (document.visibilityState === "hidden") publishIfChanged();
+      };
+      document.addEventListener("visibilitychange", publishOnHide);
+      window.addEventListener("pagehide", publishIfChanged);
+      onHideCleanup = () => {
+        document.removeEventListener("visibilitychange", publishOnHide as () => void);
+        window.removeEventListener("pagehide", publishIfChanged);
+      };
     })();
 
     return () => {
       cancelled = true;
       if (timer !== undefined) clearInterval(timer);
+      onHideCleanup?.();
     };
     // Deliberately empty: this must run once for the lifetime of the mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps

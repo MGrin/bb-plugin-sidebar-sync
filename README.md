@@ -25,8 +25,14 @@ change it, but those two are refused even when listed explicitly.
 ## How it works
 
 Plugin KV holds the canonical snapshot. Each UI pulls it on mount, applies any
-differing key, then polls its own localStorage once a second and pushes what
-changed. The server merges (rather than replaces) and publishes on a realtime
+differing key, then checks its own localStorage **once a minute** — and
+immediately when the tab is hidden — and pushes what changed.
+
+The slow poll is deliberate. This is a usability preference, not live state:
+the *receiving* side is already instant over the realtime channel, so the poll
+only governs how quickly a local edit is noticed. Publishing on hide is what
+makes a 60s poll feel immediate — rearrange on the laptop, pick up the phone,
+and it is already there. The server merges (rather than replaces) and publishes on a realtime
 channel, so other open UIs apply the change immediately.
 
 Applying writes localStorage **and dispatches a synthetic `StorageEvent`**. bb's
